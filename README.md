@@ -1,6 +1,6 @@
 # Astro Pokémon - Proyecto Airflow
 
-Este proyecto utiliza Apache Airflow y Astro CLI para construir un pipeline de extracción, transformación y consolidación de datos sobre Pokémon, empleando llamadas a APIs públicas. Su propósito es servir como ejemplo didáctico para la materia **Ciencia de Datos**, mostrando cómo automatizar flujos de trabajo de análisis de datos.
+Este proyecto utiliza Apache Airflow y Astro CLI para construir un pipeline de extracción, transformación y consolidación de datos sobre Pokémon, empleando llamadas a APIs públicas. Su propósito es servir como ejemplo didáctico para la materia **Ciencia de Datos** de la carrera de Ingeniería en Sistemas de la UTN FRM, mostrando cómo automatizar flujos de trabajo de análisis de datos.
 
 ---
 
