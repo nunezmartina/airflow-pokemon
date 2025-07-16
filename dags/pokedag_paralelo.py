@@ -9,7 +9,7 @@ import json
 import time
 import logging
 from requests.exceptions import ConnectionError, HTTPError
-logging.getLogger("airflow.providers.http").setLevel(logging.WARNING)
+logging.getLogger("airflow.hooks.base").setLevel(logging.ERROR)
 
 POKEMON_LIMIT = 1000
 OUTPUT_PATH = "/tmp/pokemon_data/pokemon_base.csv"
@@ -28,57 +28,150 @@ default_args = {
 
 # Tarea A: /pokemon/{id}
 def download_pokemon_data(**kwargs):
-    urls = [item['url'] for item in json.loads(kwargs['ti'].xcom_pull(task_ids='fetch_pokemon_list'))['results']]
+    import os
+    import json
+    import time
+    import logging
+    from airflow.providers.http.hooks.http import HttpHook
+
+    # Obtener la lista de Pokémon desde el XCom de fetch_pokemon_list
+    ti = kwargs['ti']
+    results = json.loads(ti.xcom_pull(task_ids='fetch_pokemon_list'))['results']
+    os.makedirs(os.path.dirname(POKEMON_DATA_PATH), exist_ok=True)
+
+    # Si el archivo pokemon_data.json ya existe, lo cargamos para evitar repetir descargas
+    if os.path.exists(POKEMON_DATA_PATH):
+        with open(POKEMON_DATA_PATH, 'r') as f:
+            pokemon_data = json.load(f)
+
+        # Creamos un set con los nombres ya descargados para comparación rápida
+        done_names = {p['name'] for p in pokemon_data}
+        logging.info(f"[INFO] Ya existen {len(done_names)} pokémon descargados.")
+    else:
+        pokemon_data = []
+        done_names = set()
+
+    # Inicializamos el hook HTTP para hacer las requests a la pokeapi
     hook = HttpHook(http_conn_id='pokeapi', method='GET')
-    pokemon_data = []
+
     try:
-        for i, url in enumerate(urls):
+        # Iteramos sobre los Pokémon disponibles
+        for i, entry in enumerate(results):
+            name = entry['name']
+
+            # Si ya lo descargamos antes, lo salteamos
+            if name in done_names:
+                continue
+
+            url = entry['url']
             pokemon_id = url.strip('/').split('/')[-1]
             endpoint = f"/pokemon/{pokemon_id}/"
+
+            # Hacemos la request a la API
             res = hook.run(endpoint)
-            pokemon_data.append(res.json())
-            time.sleep(0.5)
+            pokemon = res.json()
+
+            # Guardamos el JSON crudo en la lista
+            pokemon_data.append(pokemon)
+            done_names.add(name)
+
+            # Guardado parcial cada 100 Pokémon
             if (i + 1) % 100 == 0:
-                logging.info(f"[INFO] {i + 1} Pokémon descargados")
+                with open(POKEMON_DATA_PATH, 'w') as f:
+                    json.dump(pokemon_data, f)
+                logging.info(f"[INFO] {i + 1} pokémon procesados (hasta ahora {len(pokemon_data)} guardados)")
+
+            # Para no saturar la API
+            time.sleep(0.5)
+
     except Exception as e:
-        logging.error(f"[ERROR] Interrupción al descargar Pokémon: {e}")
-        os.makedirs(os.path.dirname(POKEMON_DATA_PATH), exist_ok=True)
+        # Si hay error, guardamos lo que se pudo descargar y relanzamos el error
+        logging.error(f"[ERROR] Interrupción en pokémon: {e}")
         with open(POKEMON_DATA_PATH, 'w') as f:
             json.dump(pokemon_data, f)
         raise e
 
-    os.makedirs(os.path.dirname(POKEMON_DATA_PATH), exist_ok=True)
+    # Guardado final completo
     with open(POKEMON_DATA_PATH, 'w') as f:
         json.dump(pokemon_data, f)
 
+    logging.info(f"[INFO] Descarga finalizada con {len(pokemon_data)} pokémon.")
+
+
 # Tarea B: /pokemon-species/{id}
 def download_species_data(**kwargs):
-    urls = [item['url'] for item in json.loads(kwargs['ti'].xcom_pull(task_ids='fetch_pokemon_list'))['results']]
+    import os
+    import json
+    import time
+    import logging
+    from airflow.providers.http.hooks.http import HttpHook
+
+    # Obtener lista de Pokémon desde la tarea anterior (fetch_pokemon_list)
+    ti = kwargs['ti']
+    results = json.loads(ti.xcom_pull(task_ids='fetch_pokemon_list'))['results']
+    os.makedirs(os.path.dirname(SPECIES_DATA_PATH), exist_ok=True)
+
+    # Si el archivo species_data.json ya existe, lo cargamos para evitar repeticiones
+    if os.path.exists(SPECIES_DATA_PATH):
+        with open(SPECIES_DATA_PATH, 'r') as f:
+            species_data = json.load(f)
+
+        # Creamos un set con los nombres ya descargados para comparación rápida
+        done_names = {s['name'] for s in species_data}
+        logging.info(f"[INFO] Ya existen {len(done_names)} species descargadas.")
+    else:
+        species_data = []
+        done_names = set()
+
+    # Inicializamos el hook para hacer las requests a pokeapi
     hook = HttpHook(http_conn_id='pokeapi', method='GET')
-    species_data = []
+
     try:
-        for i, url in enumerate(urls):
+        # Iteramos sobre todos los Pokémon recibidos en la lista original
+        for i, entry in enumerate(results):
+            name = entry['name']
+
+            # Si ya descargamos esta species previamente, la salteamos
+            if name in done_names:
+                continue
+
+            url = entry['url']
             pokemon_id = url.strip('/').split('/')[-1]
             endpoint = f"/pokemon-species/{pokemon_id}/"
+
+            # Hacemos la request y parseamos la respuesta
             res = hook.run(endpoint)
             species = res.json()
+
+            # Guardamos solo el nombre y la generación en el archivo local
             species_data.append({
                 'name': species['name'],
                 'generation': species['generation']['name']
             })
-            time.sleep(0.5)
+            done_names.add(species['name'])
+
+            # Cada 100 species, escribimos un backup del archivo parcial
             if (i + 1) % 100 == 0:
-                logging.info(f"[INFO] {i + 1} species descargadas")
+                with open(SPECIES_DATA_PATH, 'w') as f:
+                    json.dump(species_data, f)
+                logging.info(f"[INFO] {i + 1} species procesadas (hasta ahora {len(species_data)} guardadas)")
+
+            # Dormimos medio segundo para no saturar la API
+            time.sleep(0.5)
+
     except Exception as e:
-        logging.error(f"[ERROR] Interrupción al descargar species: {e}")
-        os.makedirs(os.path.dirname(SPECIES_DATA_PATH), exist_ok=True)
+        # Si algo falla, guardamos lo que se haya descargado hasta ahora
+        logging.error(f"[ERROR] Interrupción en species: {e}")
         with open(SPECIES_DATA_PATH, 'w') as f:
             json.dump(species_data, f)
-        raise e
+        raise e  # relanzamos el error para que Airflow marque la tarea como fallida
 
-    os.makedirs(os.path.dirname(SPECIES_DATA_PATH), exist_ok=True)
+    # Guardado final completo por si el total no es múltiplo de 100
     with open(SPECIES_DATA_PATH, 'w') as f:
         json.dump(species_data, f)
+
+    logging.info(f"[INFO] Descarga finalizada con {len(species_data)} species.")
+
 
 # Tarea C: combinar y transformar
 def merge_and_transform_data(**kwargs):
