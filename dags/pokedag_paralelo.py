@@ -143,10 +143,11 @@ def download_species_data(**kwargs):
             res = hook.run(endpoint)
             species = res.json()
 
-            # Guardamos solo el nombre y la generación en el archivo local
+            # Guardamos nombre, generación e info de legendario
             species_data.append({
                 'name': species['name'],
-                'generation': species['generation']['name']
+                'generation': species['generation']['name'],
+                'is_legendary': species['is_legendary']
             })
             done_names.add(species['name'])
 
@@ -179,10 +180,13 @@ def merge_and_transform_data(**kwargs):
         pokemon_data = json.load(f)
     with open(SPECIES_DATA_PATH, 'r') as f:
         species_data = json.load(f)
-    species_lookup = {s['name']: s['generation'] for s in species_data}
+    species_lookup = {
+        s['name']: {'generation': s['generation'], 'is_legendary': s['is_legendary']}
+        for s in species_data
+    }
     tidy_records = []
     for p in pokemon_data:
-        p['generation'] = species_lookup.get(p['name'])  # puede quedar como None
+        p_info = species_lookup.get(p['name'], {})  # puede quedar como None
         stats = {s['stat']['name']: s['base_stat'] for s in p.get('stats', [])}
         types = sorted(p.get('types', []), key=lambda t: t['slot'])
         tidy_records.append({
@@ -191,7 +195,8 @@ def merge_and_transform_data(**kwargs):
             "height": p.get("height"),
             "weight": p.get("weight"),
             "base_experience": p.get("base_experience"),
-            "generation": p.get("generation"),
+            "generation": p_info.get("generation"),
+            "is_legendary": p_info.get("is_legendary", False),
             "type_1": types[0]['type']['name'] if len(types) > 0 else None,
             "type_2": types[1]['type']['name'] if len(types) > 1 else None,
             "hp": stats.get("hp"),
