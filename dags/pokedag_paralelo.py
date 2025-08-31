@@ -193,7 +193,7 @@ def enviar_correo_manual(**kwargs):
     if not smtp_user or not smtp_password:
         raise RuntimeError("Faltan variables de entorno SMTP_USER / SMTP_PASSWORD")
 
-    to_addr = "cienciadedatos.frm.utn@gmail.com"
+    to_addr = "nunezmartina2024@gmail.com"
     subject = f"Entrega {GROUP_NAME} - {ds}"
     body = f"""
     Hola, adjuntamos la entrega del {ds}.
