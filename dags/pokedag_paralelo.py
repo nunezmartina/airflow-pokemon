@@ -86,8 +86,18 @@ def download_pokemon_data(**kwargs):
 
 # ========= Tarea B: /pokemon-species/{id} =========
 def download_species_data(**kwargs):
+    """
+    Descarga /pokemon-species/{id} para cada entrada de la lista de /pokemon,
+    saltando las formas que no tienen species (ids >= 10000) o cualquier 404.
+    Hace guardados parciales y es idempotente.
+    """
+    import os, json, time, logging
+    from airflow.providers.http.hooks.http import HttpHook
+
     ti = kwargs['ti']
-    results = json.loads(ti.xcom_pull(task_ids='fetch_pokemon_list'))['results']
+    raw = ti.xcom_pull(task_ids='fetch_pokemon_list')
+    results = json.loads(raw)['results']
+
     os.makedirs(os.path.dirname(SPECIES_DATA_PATH), exist_ok=True)
 
     if os.path.exists(SPECIES_DATA_PATH):
@@ -100,38 +110,68 @@ def download_species_data(**kwargs):
 
     hook = HttpHook(http_conn_id='pokeapi', method='GET')
 
-    try:
-        for i, entry in enumerate(results):
-            name = entry['name']
-            if name in done_names:
+    procesadas = 0
+    saltadas = 0
+    for i, entry in enumerate(results, start=1):
+        name = entry['name']
+        if name in done_names:
+            continue
+
+        # id que viene en la URL de /pokemon
+        url = entry['url']
+        pokemon_id = url.strip('/').split('/')[-1]
+
+        # ⚠️ Mega/forma: ids >= 10000 no tienen /pokemon-species -> se salta
+        try:
+            pid = int(pokemon_id)
+            if pid >= 10000:
+                saltadas += 1
+                logging.info(f"[SKIP] {name} (id {pid}) es forma/mega; no existe en /pokemon-species. Se salta.")
                 continue
-            url = entry['url']
-            pokemon_id = url.strip('/').split('/')[-1]
-            endpoint = f"/pokemon-species/{pokemon_id}/"
+        except ValueError:
+            # Si no es numérico por algún motivo, también lo saltamos
+            saltadas += 1
+            logging.info(f"[SKIP] {name} (id '{pokemon_id}') no numérico. Se salta.")
+            continue
+
+        endpoint = f"/pokemon-species/{pokemon_id}/"
+        try:
             res = hook.run(endpoint)
+            if res.status_code == 404:
+                saltadas += 1
+                logging.info(f"[SKIP] /pokemon-species/{pokemon_id} devolvió 404 para {name}. Se salta.")
+                continue
+            res.raise_for_status()
             species = res.json()
+
             species_data.append({
-                'name': species['name'],
-                'generation': species['generation']['name'],
-                'is_legendary': species['is_legendary']
+                'name': species.get('name'),
+                'generation': (species.get('generation') or {}).get('name'),
+                'is_legendary': bool(species.get('is_legendary', False)),
             })
-            done_names.add(species['name'])
+            done_names.add(species.get('name'))
+            procesadas += 1
 
-            if (i + 1) % 100 == 0:
-                with open(SPECIES_DATA_PATH, 'w') as f:
-                    json.dump(species_data, f)
-                logging.info(f"[INFO] {i + 1} species procesadas (hasta ahora {len(species_data)} guardadas)")
+        except Exception as e:
+            # No frenamos toda la tarea por un item problemático: lo registramos y seguimos
+            saltadas += 1
+            logging.warning(f"[WARN] Error en species {name} (id {pokemon_id}): {e}. Se salta.")
+            continue
 
-            time.sleep(0.5)
-    except Exception as e:
-        logging.error(f"[ERROR] Interrupción en species: {e}")
-        with open(SPECIES_DATA_PATH, 'w') as f:
-            json.dump(species_data, f)
-        raise e
+        # Guardado parcial cada 100
+        if (i % 100) == 0:
+            with open(SPECIES_DATA_PATH, 'w') as f:
+                json.dump(species_data, f)
+            logging.info(f"[INFO] {i} entradas recorridas, {procesadas} species guardadas, {saltadas} saltadas.")
 
+        time.sleep(0.2)  # un poco más amable con la API
+
+    # Guardado final
     with open(SPECIES_DATA_PATH, 'w') as f:
         json.dump(species_data, f)
-    logging.info(f"[INFO] Descarga finalizada con {len(species_data)} species.")
+
+    logging.info(f"[INFO] Species completo: {procesadas} guardadas, {saltadas} saltadas, total file={len(species_data)}.")
+
 
 # ========= Tarea C: merge + columna 'grupo' + CSV en output/final_{{ ds }}.csv =========
 def merge_and_transform_data(**kwargs):
