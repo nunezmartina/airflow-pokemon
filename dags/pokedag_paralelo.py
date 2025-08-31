@@ -194,22 +194,28 @@ def exportar_logs_reales_zip(**kwargs):
     shutil.make_archive(zip_base, 'zip', logs_dir)
     print(f"[INFO] ZIP de logs creado: {zip_base}.zip")
 
-# ========= Tarea E: Enviar correo con adjuntos (SMTP_USER/PASSWORD) =========
+# ========= Tarea E: Enviar correo con adjuntos (SMTP_USER/PASSWORD) [ROBUSTA] =========
 def enviar_correo_manual(**kwargs):
+    import socket
     ds = kwargs["ds"]
     csv_path = os.path.join(OUTPUT_DIR, f"final_{ds}.csv")
     zip_path = os.path.join(OUTPUT_DIR, f"logs_{ds}.zip")
 
-    # Chequeo de adjuntos
-    for p in [csv_path, zip_path]:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"Falta adjunto: {p}")
+    # 1) Chequeo de adjuntos
+    missing = [p for p in [csv_path, zip_path] if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(
+            f"Faltan adjuntos para enviar: {missing}. "
+            f"Verifica que las tareas anteriores generen esos archivos en {OUTPUT_DIR}"
+        )
 
+    # 2) Credenciales y destino
     to_addr = "cienciadedatos.frm.utn@gmail.com"
     smtp_user = os.getenv("SMTP_USER")
     smtp_pass = os.getenv("SMTP_PASSWORD")
     if not smtp_user or not smtp_pass:
-        raise RuntimeError("Faltan variables de entorno SMTP_USER / SMTP_PASSWORD.")
+        raise RuntimeError("Faltan variables de entorno SMTP_USER / SMTP_PASSWORD. "
+                           "Defínelas en scheduler/webserver/worker y reinicia servicios.")
 
     subject = f"Entrega {GROUP_NAME} - {ds}"
     body = (
@@ -218,35 +224,56 @@ def enviar_correo_manual(**kwargs):
         f"Enviado automáticamente desde Airflow."
     )
 
+    # 3) Construir el mail
     msg = MIMEMultipart()
     msg["From"] = smtp_user
     msg["To"] = to_addr
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    # Adjuntar CSV
-    with open(csv_path, "rb") as f:
-        part_csv = MIMEBase("application", "octet-stream")
-        part_csv.set_payload(f.read())
-    encoders.encode_base64(part_csv)
-    part_csv.add_header("Content-Disposition", f'attachment; filename="final_{ds}.csv"')
-    msg.attach(part_csv)
+    def _attach(path, mime_main="application", mime_sub="octet-stream", filename=None):
+        with open(path, "rb") as f:
+            part = MIMEBase(mime_main, mime_sub)
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition",
+                        f'attachment; filename="{filename or os.path.basename(path)}"')
+        msg.attach(part)
 
-    # Adjuntar ZIP
-    with open(zip_path, "rb") as f:
-        part_zip = MIMEBase("application", "zip")
-        part_zip.set_payload(f.read())
-    encoders.encode_base64(part_zip)
-    part_zip.add_header("Content-Disposition", f'attachment; filename="logs_{ds}.zip"')
-    msg.attach(part_zip)
+    _attach(csv_path, "application", "octet-stream", f"final_{ds}.csv")
+    _attach(zip_path, "application", "zip", f"logs_{ds}.zip")
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+    # 4) Enviar (intenta 587 STARTTLS y hace fallback a 465 SSL)
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
+        server.set_debuglevel(1)  # Log SMTP detallado en los logs de la tarea
         server.ehlo()
         server.starttls()
+        server.ehlo()
         server.login(smtp_user, smtp_pass)
         server.sendmail(smtp_user, [to_addr], msg.as_string())
-
-    logging.info(f"[INFO] Email enviado a {to_addr} con adjuntos.")
+        server.quit()
+        logging.info(f"[INFO] Email enviado a {to_addr} con adjuntos (vía 587 STARTTLS).")
+    except (smtplib.SMTPAuthenticationError) as e:
+        raise RuntimeError(
+            f"Autenticación SMTP falló: {e}. "
+            "Verifica que SMTP_PASSWORD sea la contraseña de aplicación (16 caracteres) y que 2FA esté activo."
+        )
+    except (socket.gaierror, TimeoutError, smtplib.SMTPServerDisconnected) as e:
+        logging.warning(f"[WARN] Falló conexión por 587 ({e}). Intentando 465/SSL…")
+        try:
+            server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30)
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, [to_addr], msg.as_string())
+            server.quit()
+            logging.info(f"[INFO] Email enviado a {to_addr} con adjuntos (vía 465 SSL).")
+        except Exception as e2:
+            raise RuntimeError(
+                f"No se pudo enviar por 465/SSL: {e2}. "
+                "Puede que la red bloquee puertos 587/465 o haya inspección TLS."
+            )
+    except Exception as e:
+        raise RuntimeError(f"Error inesperado al enviar: {e}")
 
 # ========= DAG =========
 with DAG(
@@ -294,4 +321,3 @@ with DAG(
     )
 
     fetch_pokemon_list >> [download_a, download_b] >> merge_transform >> zip_logs >> send_email
-
