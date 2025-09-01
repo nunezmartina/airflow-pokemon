@@ -308,7 +308,7 @@ def enviar_correo_manual(**kwargs):
         )
 
     # 2) Credenciales y destino
-    to_addr = "cienciadedatos.frm.utn@gmail.com"
+    to_addr = "nunezmartina2024@gmail.com"
     smtp_user = os.getenv("SMTP_USER")
     smtp_pass = os.getenv("SMTP_PASSWORD")
     if not smtp_user or not smtp_pass:
