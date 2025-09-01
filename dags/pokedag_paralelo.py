@@ -41,48 +41,106 @@ default_args = {
 
 # ========= Tarea A: /pokemon/{id} =========
 def download_pokemon_data(**kwargs):
+    """
+    Descarga /pokemon/{id} con reintentos y backoff.
+    Maneja 429 (rate limit), 5xx, timeouts y 404 sin romper toda la tarea.
+    Guarda parciales e ignora duplicados.
+    """
+    import os, json, time, logging, math
+    from requests.exceptions import ConnectionError, HTTPError, Timeout
+    from airflow.providers.http.hooks.http import HttpHook
+
     ti = kwargs['ti']
-    results = json.loads(ti.xcom_pull(task_ids='fetch_pokemon_list'))['results']
+    raw = ti.xcom_pull(task_ids='fetch_pokemon_list')
+    if not raw:
+        raise RuntimeError("[ERR] XCom de fetch_pokemon_list vacío.")
+    try:
+        results = json.loads(raw)['results']
+    except Exception as e:
+        raise RuntimeError(f"[ERR] No pude parsear XCom de fetch_pokemon_list: {e}")
+
     os.makedirs(os.path.dirname(POKEMON_DATA_PATH), exist_ok=True)
 
+    # Cargar progreso previo
     if os.path.exists(POKEMON_DATA_PATH):
         with open(POKEMON_DATA_PATH, 'r') as f:
-            pokemon_data = json.load(f)
-        done_names = {p['name'] for p in pokemon_data}
-        logging.info(f"[INFO] Ya existen {len(done_names)} pokémon descargados.")
+            try:
+                pokemon_data = json.load(f)
+            except Exception:
+                pokemon_data = []
+        done_names = {p.get('name') for p in pokemon_data if isinstance(p, dict)}
+        logging.info(f"[INFO] Reanudando: {len(done_names)} pokémon ya descargados.")
     else:
         pokemon_data, done_names = [], set()
 
     hook = HttpHook(http_conn_id='pokeapi', method='GET')
 
-    try:
-        for i, entry in enumerate(results):
-            name = entry['name']
-            if name in done_names:
-                continue
-            url = entry['url']
-            pokemon_id = url.strip('/').split('/')[-1]
-            endpoint = f"/pokemon/{pokemon_id}/"
-            res = hook.run(endpoint)
-            pokemon = res.json()
-            pokemon_data.append(pokemon)
-            done_names.add(name)
+    def fetch_with_retry(endpoint, max_tries=6):
+        """
+        Reintenta con backoff exponencial: 0.5s,1s,2s,4s,8s,16s
+        Solo reintenta en 429/5xx/errores de red. 404 devuelve None.
+        """
+        for attempt in range(max_tries):
+            try:
+                res = hook.run(endpoint)
+                status = res.status_code
+                if status == 404:
+                    return None   # no existe -> saltar
+                if status in (429,) or (500 <= status < 600):
+                    # rate limit / server error -> retry
+                    wait = 0.5 * (2 ** attempt)
+                    logging.warning(f"[WARN] {endpoint} -> {status}. Reintentando en {wait:.1f}s…")
+                    time.sleep(wait)
+                    continue
+                res.raise_for_status()
+                return res.json()
+            except (ConnectionError, Timeout, HTTPError) as e:
+                wait = 0.5 * (2 ** attempt)
+                logging.warning(f"[WARN] Error red/HTTP en {endpoint}: {e}. Retry en {wait:.1f}s…")
+                time.sleep(wait)
+            except Exception as e:
+                # error inesperado -> no bloquea toda la corrida, solo este item
+                logging.warning(f"[WARN] Error inesperado en {endpoint}: {e}. Se salta.")
+                return None
+        logging.error(f"[ERR] Máximos reintentos agotados para {endpoint}.")
+        return None
 
-            if (i + 1) % 100 == 0:
-                with open(POKEMON_DATA_PATH, 'w') as f:
-                    json.dump(pokemon_data, f)
-                logging.info(f"[INFO] {i + 1} pokémon procesados (hasta ahora {len(pokemon_data)} guardados)")
+    procesados = 0
+    saltados = 0
+    for i, entry in enumerate(results, start=1):
+        name = entry.get('name')
+        if name in done_names:
+            continue
 
-            time.sleep(0.5)
-    except Exception as e:
-        logging.error(f"[ERROR] Interrupción en pokémon: {e}")
-        with open(POKEMON_DATA_PATH, 'w') as f:
-            json.dump(pokemon_data, f)
-        raise e
+        url = entry.get('url', '')
+        pokemon_id = url.strip('/').split('/')[-1] if url else None
+        if not pokemon_id or not pokemon_id.isdigit():
+            saltados += 1
+            logging.info(f"[SKIP] Entrada sin id numérico: {name} ({pokemon_id}).")
+            continue
 
+        endpoint = f"/pokemon/{pokemon_id}/"
+        data = fetch_with_retry(endpoint)
+        if data is None:
+            saltados += 1
+            continue
+
+        pokemon_data.append(data)
+        done_names.add(name)
+        procesados += 1
+
+        if (i % 100) == 0:
+            with open(POKEMON_DATA_PATH, 'w') as f:
+                json.dump(pokemon_data, f)
+            logging.info(f"[INFO] {i} recorridos | {procesados} guardados | {saltados} saltados.")
+
+        time.sleep(0.2)  # ser amable con la API
+
+    # Guardado final
     with open(POKEMON_DATA_PATH, 'w') as f:
         json.dump(pokemon_data, f)
-    logging.info(f"[INFO] Descarga finalizada con {len(pokemon_data)} pokémon.")
+    logging.info(f"[INFO] Pokémon completo: {procesados} guardados, {saltados} saltados, file={len(pokemon_data)}.")
+
 
 # ========= Tarea B: /pokemon-species/{id} =========
 def download_species_data(**kwargs):
